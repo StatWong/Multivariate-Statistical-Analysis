@@ -1,0 +1,636 @@
+---
+title: "Untitled"
+author: "Nihaochen"
+date: "2025-05-22"
+output: html_document
+message: false 
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(caret)       
+library(randomForest) 
+library(xgboost)     
+library(factoextra)  
+library(ggplot2)
+library(dplyr)
+library(corrplot)
+library(plotly) 
+library(FactoMineR)
+library(psych)
+library(reshape2)
+library(pROC)
+library(keras)
+library(tensorflow)
+library(e1071)
+```
+
+```{r}
+# 1. 读取数据
+data <- read.csv("C:/r-data/train.csv")
+data_selected <- data %>%
+  select(-id, -day)
+# 将 rainfall 分离，其余变量标准化
+rainfall <- data_selected$rainfall
+predictors <- data_selected %>% select(-rainfall)
+# 标准化（Z-score）
+predictors_scaled <- scale(predictors)
+```
+
+```{r}
+var_names <- names(predictors)
+# 用于保存结果
+results <- list()
+# 枚举所有变量组合（从2个变量起）
+for (k in 2:length(var_names)) {
+  var_combos <- combn(var_names, k, simplify = FALSE)
+  for (combo in var_combos) {
+    # 取子集并标准化
+    subset_data <- predictors[, combo]
+    subset_scaled <- scale(subset_data)
+    # 聚类
+    set.seed(123)
+    km <- kmeans(subset_scaled, centers = 2)
+    cluster <- as.factor(km$cluster)
+    # 尝试两种聚类标签与rainfall的映射方式，选取正确率高的那种
+    acc1 <- mean(cluster == rainfall)
+    acc2 <- mean(rev(levels(cluster))[cluster] == rainfall)
+    accuracy <- max(acc1, acc2)
+    # 存储结果
+    results[[paste(combo, collapse = "+")]] <- list(
+      variables = combo,
+      accuracy = accuracy
+    )
+  }
+}
+# 整理结果
+accuracy_df <- tibble(
+  variables = names(results),
+  accuracy = map_dbl(results, ~ .x$accuracy)
+) %>%
+  arrange(desc(accuracy))
+# 查看最高准确率组合
+head(accuracy_df, 10)
+```
+
+```{r}
+subset_vars <- predictors[, c("cloud", "winddirection")]
+subset_scaled <- scale(subset_vars)
+
+# 设置随机种子保证结果可复现
+set.seed(123)
+
+# k-means 聚类，k=2
+km <- kmeans(subset_scaled, centers = 2)
+
+# 聚类结果转因子
+cluster <- as.factor(km$cluster)
+
+# 查看每个簇大小
+cat("各聚类簇大小:\n")
+print(table(cluster))
+
+# 查看簇中心（以标准化后的变量为单位）
+cat("\n簇中心（标准化变量）:\n")
+print(km$centers)
+
+# 构建聚类标签与实际rainfall的混淆矩阵
+cat("\n聚类标签与真实rainfall的混淆矩阵:\n")
+print(table(Cluster = cluster, Rainfall = rainfall))
+
+# 计算两种映射准确率（用于选最佳映射）
+acc1 <- mean(cluster == rainfall)
+acc2 <- mean(rev(levels(cluster))[cluster] == rainfall)
+cat("\n聚类标签与rainfall映射的两种准确率：\n")
+cat("直接匹配准确率:", acc1, "\n")
+cat("反转标签准确率:", acc2, "\n")
+
+# 画散点图展示聚类结果
+plot_df <- as.data.frame(subset_scaled) %>%
+  mutate(Cluster = cluster, Rainfall = as.factor(rainfall))
+
+ggplot(plot_df, aes(x = cloud, y = winddirection, color = Cluster, shape = Rainfall)) +
+  geom_point(alpha = 0.7, size = 3) +
+  labs(title = "Cloud和Winddirection的K-means聚类结果",
+       x = "Cloud (标准化后)", y = "Winddirection (标准化后)") +
+  theme_minimal()
+```
+
+
+```{r}
+set.seed(123)
+kmeans_result <- kmeans(predictors_scaled, centers = 2)
+kmeans_result$centers 
+# PCA降到2维
+pca_sample <- prcomp(predictors_scaled, center = FALSE, scale. = FALSE)
+pca_2d <- as.data.frame(pca_sample$x[, 1:2])
+pca_3d <- as.data.frame(pca_sample$x[, 1:3])
+names(pca_2d) <- c("PC1", "PC2")
+pca_2d$cluster <- as.factor(kmeans_result$cluster)
+pca_2d$rainfall <- as.factor(rainfall)
+
+pca_2d <- pca_2d %>%
+  mutate(combo = case_when(
+    cluster == "1" & rainfall == "1" ~ "聚类1_下雨",
+    cluster == "1" & rainfall == "0" ~ "聚类1_不下雨",
+    cluster == "2" & rainfall == "1" ~ "聚类2_下雨",
+    cluster == "2" & rainfall == "0" ~ "聚类2_不下雨"
+  ))
+
+color_map <- c(
+  "聚类1_下雨" = "#1f77b4",   # 蓝色
+  "聚类1_不下雨" = "#d62728", # 红色
+  "聚类2_下雨" = "#ff7f0e",   # 橘色
+  "聚类2_不下雨" = "purple"  # 紫色
+)  
+
+ggplot(pca_2d, aes(x = PC1, y = PC2, color = combo)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_map) +
+  theme_minimal() +
+  labs(title = "K-means聚类+Rainfall组合的二维PCA散点图",
+       color = "组合类别")
+```
+
+```{r}
+# 对变量做 PCA
+pca_variable <- prcomp(predictors_scaled, center = FALSE, scale. = FALSE)
+# 查看主成分解释的方差
+summary(pca_variable)
+#查看变量对主成分空间的贡献
+loadings <- pca_variable$rotation[, 1:3]
+print(loadings)
+# 变量在前三个主成分的旋转矩阵
+loadings <- as.data.frame(pca_variable$rotation[, 1:3])
+loadings$var <- rownames(loadings)
+arrow_lines <- data.frame(
+  x = c(rbind(0, loadings$PC1)),
+  y = c(rbind(0, loadings$PC2)),
+  z = c(rbind(0, loadings$PC3)),
+  group = rep(1:nrow(loadings), each = 2)
+)
+# 绘图：线条 + 文本分开添加
+plot_ly() %>%
+  # 添加线段（箭头）
+  add_trace(
+    data = arrow_lines,
+    type = "scatter3d",
+    mode = "lines",
+    x = ~x, y = ~y, z = ~z,
+    split = ~group,  # 分组绘制每条线
+    line = list(color = 'gray', width = 4),
+    showlegend = FALSE
+  ) %>%
+  add_trace(
+    data = loadings,
+    type = "scatter3d",
+    mode = "text",
+    x = ~PC1, y = ~PC2, z = ~PC3,
+    text = ~var,
+    textposition = "top center",
+    textfont = list(size = 12),
+    showlegend = FALSE
+  ) %>%
+  layout(
+    title = "变量主成分投影（3D箭头图）",
+    scene = list(
+      xaxis = list(title = "PC1"),
+      yaxis = list(title = "PC2"),
+      zaxis = list(title = "PC3")
+    )
+  )
+rainfall_factor <- factor(rainfall, levels = c(0,1), labels = c("不下雨", "下雨"))
+pca_3d$rainfall <- rainfall_factor
+# 3D 可视化）
+fig <- plot_ly(
+  pca_3d,
+  x = ~PC1, y = ~PC2, z = ~PC3,
+  color = ~rainfall,  # 使用因子分组
+  colors = c("#1f77b4", "#d62728"),  
+  type = 'scatter3d',
+  mode = 'markers',
+  marker = list(size = 3, opacity = 0.8)
+) %>%
+  layout(
+    title = "样本主成分空间中的降雨状态",
+    scene = list(
+      xaxis = list(title = 'PC1'),
+      yaxis = list(title = 'PC2'),
+      zaxis = list(title = 'PC3')
+    ),
+    legend = list(title = list(text = "<b>降雨状态</b>"))
+  )
+
+fig
+
+```
+
+```{r}
+pca_top3 <- as.data.frame(pca_variable$x[, 1:3])
+# K-means 聚类（使用前3个主成分）
+set.seed(123)
+km_pca <- kmeans(pca_top3, centers = 2)
+# 获取聚类标签与 rainfall 比较准确率
+cluster <- as.factor(km_pca$cluster)
+# 计算两种标签顺序下的准确率
+acc1 <- mean(cluster == rainfall)
+acc2 <- mean(rev(levels(cluster))[cluster] == rainfall)
+accuracy <- max(acc1, acc2)
+# 输出准确率
+cat("使用前3个主成分做K-means聚类后的准确率为：", round(accuracy, 4), "\n")
+```
+因子分析
+```{r}
+# 确定因子数量（可以先用平行分析/碎石图辅助判断）
+fa.parallel(predictors_scaled, fa = "fa")
+# 进行因子分析（选择 3 个因子）
+fa_result <- fa(predictors_scaled, nfactors = 3, rotate = "varimax", fm = "ml")
+# 3. 查看载荷矩阵）
+print(fa_result$loadings, cutoff = 0.3)
+# 4. 查看因子得分
+head(fa_result$scores)
+# 如果想用于聚类或进一步分析：
+factor_scores <- as.data.frame(fa_result$scores)
+```
+
+```{r}
+#  因子分析
+fa_result <- fa(predictors_scaled, nfactors = 10, rotate = "varimax", fm = "ml")
+fa_result$Vaccounted
+fa_result <- fa(predictors_scaled, nfactors = 3, rotate = "varimax", fm = "ml")
+# 提取载荷并转换为 dataframe
+loadings_matrix <- as.data.frame(unclass(fa_result$loadings))
+loadings_matrix$Variable <- rownames(loadings_matrix)
+# 转换为 long 格式
+loadings_long <- melt(loadings_matrix, id.vars = "Variable", 
+                      variable.name = "Factor", value.name = "Loading")
+# 绘制热力图
+ggplot(loadings_long, aes(x = Factor, y = Variable, fill = Loading)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Loading, 2)), size = 4) +  # ← 添加数值标签
+  scale_fill_gradient2(low = "#d7191c", high = "#1a9641", mid = "white",
+                       midpoint = 0, limit = c(-1, 1), name = "载荷值") +
+  theme_minimal(base_size = 14) +
+  labs(title = "因子载荷热力图（含数值）", x = "因子", y = "变量") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# 提取因子得分（scores）
+fa_result <- fa(predictors_scaled, nfactors = 2, rotate = "varimax", fm = "ml")
+factor_scores <- as.data.frame(fa_result$scores[, 1:2])  # 仅提取前两个因子
+names(factor_scores) <- c("Factor1", "Factor2")
+# K-means 聚类
+set.seed(123)
+kmeans_result <- kmeans(factor_scores, centers = 2)
+# 合并 rainfall 信息
+factor_scores$cluster <- as.factor(kmeans_result$cluster)
+factor_scores$rainfall <- as.factor(rainfall)
+# 查看聚类 vs 实际 rainfall
+table(聚类 = factor_scores$cluster, 实际下雨 = factor_scores$rainfall)
+kmeans_result$centers
+```
+
+```{r}
+factor_scores <- factor_scores %>%
+  mutate(
+    label = case_when(
+      cluster == "1" & rainfall == "1" ~ "聚类1_下雨",
+      cluster == "1" & rainfall == "0" ~ "聚类1_不下雨",
+      cluster == "2" & rainfall == "1" ~ "聚类2_下雨",
+      cluster == "2" & rainfall == "0" ~ "聚类2_不下雨"
+    )
+  )
+label_colors <- c(
+  "聚类1_下雨" = "#1f77b4",   # 蓝色
+  "聚类1_不下雨" = "#d62728", # 红色
+  "聚类2_下雨" = "#ff7f0e",   # 橘色
+  "聚类2_不下雨" = "purple"  # 紫色
+)
+# 绘图
+ggplot(factor_scores, aes(x = Factor1, y = Factor2, color = label)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = label_colors) +
+  labs(
+    title = "K-means 聚类 vs 实际 rainfall 状态（因子分析空间）",
+    x = "Factor 1",
+    y = "Factor 2",
+    color = "聚类 + 实际"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# 构建数据框（标准化自变量 + 因变量）
+logit_data <- as.data.frame(predictors_scaled)
+logit_data$rainfall <- as.factor(rainfall)
+# 划分训练集和测试集
+set.seed(1234567)
+n <- nrow(logit_data)
+train_index <- sample(1:n, size = round(0.8 * n))
+train_data <- logit_data[train_index, ]
+test_data <- logit_data[-train_index, ]
+# 训练逻辑回归模型
+logit_model <- glm(rainfall ~ ., data = train_data, family = binomial)
+# 训练集预测
+predicted_prob_train <- predict(logit_model, newdata = train_data, type = "response")
+actual_train <- as.numeric(as.character(train_data$rainfall))
+predicted_class_train <- ifelse(predicted_prob_train > 0.5, 1, 0)
+# 测试集预测
+predicted_prob_test <- predict(logit_model, newdata = test_data, type = "response")
+actual_test <- as.numeric(as.character(test_data$rainfall))
+predicted_class_test <- ifelse(predicted_prob_test > 0.5, 1, 0)
+# 混淆矩阵和测试集准确率
+cat("\n=== 测试集性能 ===\n")
+confusion_matrix_test <- table(Predicted = predicted_class_test, Actual = actual_test)
+print(confusion_matrix_test)
+accuracy_test <- mean(predicted_class_test == actual_test)
+cat("测试集分类准确率：", round(accuracy_test, 4), "\n")
+# 增加：混淆矩阵和训练集准确率
+cat("\n=== 训练集性能 ===\n")
+confusion_matrix_train <- table(Predicted = predicted_class_train, Actual = actual_train)
+print(confusion_matrix_train)
+accuracy_train <- mean(predicted_class_train == actual_train)
+cat("训练集分类准确率：", round(accuracy_train, 4), "\n")
+# 计算并绘制ROC曲线和AUC - 训练集
+roc_train <- roc(response = actual_train, predictor = predicted_prob_train)
+auc_train <- auc(roc_train)
+# 计算并绘制ROC曲线和AUC - 测试集
+roc_test <- roc(response = actual_test, predictor = predicted_prob_test)
+auc_test <- auc(roc_test)
+# 绘图
+plot(roc_train, col = "blue", lwd = 2, main = "训练集与测试集 ROC 曲线")
+plot(roc_test, col = "red", lwd = 2, add = TRUE)
+legend("bottomright", legend = c(paste("训练集 AUC =", round(auc_train, 4)),
+                                 paste("测试集 AUC =", round(auc_test, 4))),
+       col = c("blue", "red"), lwd = 2, bty = "n")
+```
+
+```{r}
+# 取前三个主成分并构建数据框
+pca_df <- as.data.frame(pca_variable$x[, 1:3])
+colnames(pca_df) <- c("PC1", "PC2", "PC3")
+pca_df$rainfall <- as.factor(rainfall)
+# 划分训练集和测试集
+set.seed(111)
+n <- nrow(pca_df)
+train_index <- sample(1:n, size = round(0.8 * n))
+train_data <- pca_df[train_index, ]
+test_data <- pca_df[-train_index, ]
+# 训练逻辑回归模型（基于前三个主成分）
+logit_pca_model <- glm(rainfall ~ PC1 + PC2 + PC3, data = train_data, family = binomial)
+# 训练集预测
+predicted_prob_train <- predict(logit_pca_model, newdata = train_data, type = "response")
+predicted_class_train <- ifelse(predicted_prob_train > 0.5, 1, 0)
+actual_train <- as.numeric(as.character(train_data$rainfall))
+# 测试集预测
+predicted_prob_test <- predict(logit_pca_model, newdata = test_data, type = "response")
+predicted_class_test <- ifelse(predicted_prob_test > 0.5, 1, 0)
+actual_test <- as.numeric(as.character(test_data$rainfall))
+# 训练集测试集准确率
+accuracy_train <- mean(predicted_class_train == actual_train)
+cat("训练集准确率：", round(accuracy_train, 4), "\n")
+accuracy_test <- mean(predicted_class_test == actual_test)
+cat("测试集准确率：", round(accuracy_test, 4), "\n")
+# 训练集混淆矩阵
+cat("训练集混淆矩阵：\n")
+print(table(Predicted = predicted_class_train, Actual = actual_train))
+# 测试集混淆矩阵
+cat("测试集混淆矩阵：\n")
+print(table(Predicted = predicted_class_test, Actual = actual_test))
+# 计算并绘制ROC曲线和AUC - 训练集
+roc_train <- roc(response = actual_train, predictor = predicted_prob_train)
+auc_train <- auc(roc_train)
+# 计算并绘制ROC曲线和AUC - 测试集
+roc_test <- roc(response = actual_test, predictor = predicted_prob_test)
+auc_test <- auc(roc_test)
+# 绘图
+plot(roc_train, col = "darkgreen", lwd = 2, main = "PCA 主成分逻辑回归 ROC 曲线")
+plot(roc_test, col = "orange", lwd = 2, add = TRUE)
+legend("bottomright", legend = c(paste("训练集 AUC =", round(auc_train, 4)),
+                                 paste("测试集 AUC =", round(auc_test, 4))),
+       col = c("darkgreen", "orange"), lwd = 2, bty = "n")
+```
+
+```{r,warning=FALSE,message=FALSE}
+set.seed(123)
+n_repeats <- 30  # 重复次数
+n <- nrow(pca_df)
+# 用于存储结果
+train_accs <- numeric(n_repeats)
+test_accs <- numeric(n_repeats)
+train_aucs <- numeric(n_repeats)
+test_aucs <- numeric(n_repeats)
+for (i in 1:n_repeats) {
+  train_index <- sample(1:n, size = round(0.8 * n))
+  train_data <- pca_df[train_index, ]
+  test_data <- pca_df[-train_index, ]
+  # 拟合模型
+  model <- glm(rainfall ~ PC1 + PC2 + PC3, data = train_data, family = binomial)
+  # 训练集预测
+  prob_train <- predict(model, newdata = train_data, type = "response")
+  class_train <- ifelse(prob_train > 0.5, 1, 0)
+  actual_train <- as.numeric(as.character(train_data$rainfall))
+  train_accs[i] <- mean(class_train == actual_train)
+  train_aucs[i] <- auc(roc(response = actual_train, predictor = prob_train))
+  # 测试集预测
+  prob_test <- predict(model, newdata = test_data, type = "response")
+  class_test <- ifelse(prob_test > 0.5, 1, 0)
+  actual_test <- as.numeric(as.character(test_data$rainfall))
+  test_accs[i] <- mean(class_test == actual_test)
+  test_aucs[i] <- auc(roc(response = actual_test, predictor = prob_test))
+}
+# 输出结果均值和标准差
+cat("训练集准确率均值:", round(mean(train_accs), 4), " 标准差:", round(sd(train_accs), 4), "\n")
+cat("测试集准确率均值:", round(mean(test_accs), 4), " 标准差:", round(sd(test_accs), 4), "\n")
+cat("训练集 AUC 均值:", round(mean(train_aucs), 4), " 标准差:", round(sd(train_aucs), 4), "\n")
+cat("测试集 AUC 均值:", round(mean(test_aucs), 4), " 标准差:", round(sd(test_aucs), 4), "\n")
+```
+
+```{r}
+set.seed(111)  # 保持结果可复现
+# 随机划分训练集和测试集
+n <- nrow(predictors_scaled)
+train_index <- sample(1:n, size = round(0.8 * n))
+test_index <- setdiff(1:n, train_index)
+# 提取训练集和测试集数据
+train_predictors <- predictors_scaled[train_index, ]
+test_predictors <- predictors_scaled[test_index, ]
+train_rainfall <- rainfall[train_index]
+test_rainfall <- rainfall[test_index]
+# 在训练集上进行因子分析
+fa_train <- fa(train_predictors, nfactors = 2, rotate = "varimax", fm = "ml")
+train_scores <- as.data.frame(fa_train$scores[, 1:2])
+names(train_scores) <- c("fa_Factor1", "fa_Factor2")
+train_scores$rainfall <- as.factor(train_rainfall)
+# 用训练集拟合逻辑回归
+logit_fa_model <- glm(rainfall ~ fa_Factor1 + fa_Factor2, data = train_scores, family = binomial)
+# 在训练集上预测
+prob_train <- predict(logit_fa_model, type = "response")
+class_train <- ifelse(prob_train > 0.5, 1, 0)
+actual_train <- as.numeric(as.character(train_rainfall))
+train_accuracy <- mean(class_train == actual_train)
+train_auc <- auc(roc(response = actual_train, predictor = prob_train))
+# 对测试集进行因子分析得分（使用训练集因子载荷）
+test_scores <- as.data.frame(scale(test_predictors) %*% fa_train$loadings[, 1:2])
+names(test_scores) <- c("fa_Factor1", "fa_Factor2")
+test_scores$rainfall <- as.factor(test_rainfall)
+# 在测试集上预测
+prob_test <- predict(logit_fa_model, newdata = test_scores, type = "response")
+class_test <- ifelse(prob_test > 0.5, 1, 0)
+actual_test <- as.numeric(as.character(test_rainfall))
+test_accuracy <- mean(class_test == actual_test)
+test_auc <- auc(roc(response = actual_test, predictor = prob_test))
+# 绘制训练集和测试集 ROC 曲线
+roc_train <- roc(response = actual_train, predictor = prob_train)
+roc_test <- roc(response = actual_test, predictor = prob_test)
+plot(roc_train, col = "darkgreen", lwd = 2, main = "因子分析逻辑回归：训练集与测试集 ROC 曲线")
+lines(roc_test, col = "darkred", lwd = 2)
+legend("bottomright",
+       legend = c(paste("训练集 AUC =", round(train_auc, 4)),
+                  paste("测试集 AUC =", round(test_auc, 4))),
+       col = c("darkgreen", "darkred"), lwd = 2, bty = "n")
+# 输出准确率和AUC
+cat("训练集准确率：", round(train_accuracy, 4), "\n")
+cat("训练集 AUC：", round(train_auc, 4), "\n")
+cat("测试集准确率：", round(test_accuracy, 4), "\n")
+cat("测试集 AUC：", round(test_auc, 4), "\n")
+```
+SVM
+```{r}
+# 构建数据框（标准化自变量 + 因变量）
+logit_data <- as.data.frame(predictors_scaled)
+logit_data$rainfall <- as.factor(rainfall)
+# 划分训练集和测试集
+set.seed(1234567)
+n <- nrow(logit_data)
+train_index <- sample(1:n, size = round(0.8 * n))
+train_data <- logit_data[train_index, ]
+test_data <- logit_data[-train_index, ]
+# 训练逻辑回归模型
+logit_model <- glm(rainfall ~ ., data = train_data, family = binomial)
+cat("\n=== 训练集性能 ===\n")
+predicted_prob_train <- predict(logit_model, newdata = train_data, type = "response")
+actual_train <- as.numeric(as.character(train_data$rainfall))
+predicted_class_train <- ifelse(predicted_prob_train > 0.5, 1, 0)
+# 混淆矩阵
+confusion_train <- confusionMatrix(as.factor(predicted_class_train), as.factor(actual_train), positive = "1")
+print(confusion_train$table)
+cat("训练集分类准确率：", round(confusion_train$overall["Accuracy"], 4), "\n")
+cat("训练集 AUC：", round(auc(roc(response = actual_train, predictor = predicted_prob_train)), 4), "\n")
+cat("训练集分类指标（精确率/召回率/F1）：\n")
+print(confusion_train$byClass[c("Precision", "Recall", "F1")])
+# 绘制训练集 ROC 曲线
+roc_train <- roc(response = actual_train, predictor = predicted_prob_train)
+plot(roc_train, col = "blue", lwd = 2, main = "训练集与测试集 ROC 曲线")
+cat("\n=== 测试集性能 ===\n")
+predicted_prob_test <- predict(logit_model, newdata = test_data, type = "response")
+actual_test <- as.numeric(as.character(test_data$rainfall))
+predicted_class_test <- ifelse(predicted_prob_test > 0.5, 1, 0)
+# 混淆矩阵
+confusion_test <- confusionMatrix(as.factor(predicted_class_test), as.factor(actual_test), positive = "1")
+print(confusion_test$table)
+cat("测试集分类准确率：", round(confusion_test$overall["Accuracy"], 4), "\n")
+cat("测试集 AUC：", round(auc(roc(response = actual_test, predictor = predicted_prob_test)), 4), "\n")
+cat("测试集分类指标（精确率/召回率/F1）：\n")
+print(confusion_test$byClass[c("Precision", "Recall", "F1")])
+# 绘制测试集 ROC 曲线
+roc_test <- roc(response = actual_test, predictor = predicted_prob_test)
+plot(roc_test, col = "red", lwd = 2, add = TRUE)
+legend("bottomright", legend = c(paste("训练集 AUC =", round(auc(roc_train), 4)),
+                                 paste("测试集 AUC =", round(auc(roc_test), 4))),
+       col = c("blue", "red"), lwd = 2, bty = "n")
+
+```
+
+```{r}
+pca_df <- as.data.frame(pca_variable$x[, 1:3])
+colnames(pca_df) <- c("PC1", "PC2", "PC3")
+pca_df$rainfall <- as.factor(rainfall)
+# 划分训练集和测试集
+set.seed(1234567)
+n <- nrow(pca_df)
+train_index <- sample(1:n, size = round(0.8 * n))
+train_data <- pca_df[train_index, ]
+test_data <- pca_df[-train_index, ]
+# SVM 模型
+svm_model <- svm(rainfall ~ ., data = train_data, kernel = "radial", probability = TRUE)
+cat("\n=== 训练集性能 ===\n")
+predicted_train <- predict(svm_model, newdata = train_data, probability = TRUE)
+prob_train <- attr(predicted_train, "probabilities")[,2]  # 提取正类概率
+actual_train <- train_data$rainfall
+confusion_train <- confusionMatrix(predicted_train, actual_train, positive = "1")
+print(confusion_train$table)
+cat("训练集分类准确率：", round(confusion_train$overall["Accuracy"], 4), "\n")
+cat("训练集分类指标（精确率/召回率/F1）：\n")
+print(confusion_train$byClass[c("Precision", "Recall", "F1")])
+# 训练集 ROC 和 AUC
+roc_train <- roc(response = as.numeric(as.character(actual_train)), predictor = prob_train)
+auc_train <- auc(roc_train)
+cat("训练集 AUC：", round(auc_train, 4), "\n")
+# 绘制 ROC 曲线
+plot(roc_train, col = "blue", lwd = 2, main = "基于 PCA 的 SVM：训练集与测试集 ROC 曲线")
+cat("\n=== 测试集性能 ===\n")
+predicted_test <- predict(svm_model, newdata = test_data, probability = TRUE)
+prob_test <- attr(predicted_test, "probabilities")[,2]
+actual_test <- test_data$rainfall
+
+confusion_test <- confusionMatrix(predicted_test, actual_test, positive = "1")
+print(confusion_test$table)
+cat("测试集分类准确率：", round(confusion_test$overall["Accuracy"], 4), "\n")
+cat("测试集分类指标（精确率/召回率/F1）：\n")
+print(confusion_test$byClass[c("Precision", "Recall", "F1")])
+# 测试集 ROC 和 AUC
+roc_test <- roc(response = as.numeric(as.character(actual_test)), predictor = prob_test)
+auc_test <- auc(roc_test)
+cat("测试集 AUC：", round(auc_test, 4), "\n")
+# 绘制 ROC 曲线
+plot(roc_test, col = "red", lwd = 2, add = TRUE)
+legend("bottomright", legend = c(paste("训练集 AUC =", round(auc_train, 4)),
+                                 paste("测试集 AUC =", round(auc_test, 4))),
+       col = c("blue", "red"), lwd = 2, bty = "n")
+```
+
+```{r}
+# 提取因子得分并构造数据集
+factor_scores <- as.data.frame(fa_result$scores[, 1:2])
+colnames(factor_scores) <- c("Factor1", "Factor2")
+factor_scores$rainfall <- as.factor(rainfall)
+# 划分训练集和测试集
+set.seed(1234567)
+n <- nrow(factor_scores)
+train_index <- sample(1:n, size = round(0.8 * n))
+train_data <- factor_scores[train_index, ]
+test_data <- factor_scores[-train_index, ]
+# 训练 SVM 模型
+svm_model <- svm(rainfall ~ ., data = train_data, kernel = "radial", probability = TRUE)
+cat("\n=== 基于因子得分的 SVM：训练集性能 ===\n")
+predicted_train <- predict(svm_model, newdata = train_data, probability = TRUE)
+prob_train <- attr(predicted_train, "probabilities")[,2]
+actual_train <- train_data$rainfall
+confusion_train <- confusionMatrix(predicted_train, actual_train, positive = "1")
+print(confusion_train$table)
+cat("训练集分类准确率：", round(confusion_train$overall["Accuracy"], 4), "\n")
+cat("训练集分类指标（精确率/召回率/F1）：\n")
+print(confusion_train$byClass[c("Precision", "Recall", "F1")])
+roc_train <- roc(response = as.numeric(as.character(actual_train)), predictor = prob_train)
+auc_train <- auc(roc_train)
+cat("训练集 AUC：", round(auc_train, 4), "\n")
+plot(roc_train, col = "blue", lwd = 2, main = "基于因子得分的 SVM：训练集与测试集 ROC 曲线")
+cat("\n=== 测试集性能 ===\n")
+predicted_test <- predict(svm_model, newdata = test_data, probability = TRUE)
+prob_test <- attr(predicted_test, "probabilities")[,2]
+actual_test <- test_data$rainfall
+confusion_test <- confusionMatrix(predicted_test, actual_test, positive = "1")
+print(confusion_test$table)
+cat("测试集分类准确率：", round(confusion_test$overall["Accuracy"], 4), "\n")
+cat("测试集分类指标（精确率/召回率/F1）：\n")
+print(confusion_test$byClass[c("Precision", "Recall", "F1")])
+roc_test <- roc(response = as.numeric(as.character(actual_test)), predictor = prob_test)
+auc_test <- auc(roc_test)
+cat("测试集 AUC：", round(auc_test, 4), "\n")
+plot(roc_test, col = "red", lwd = 2, add = TRUE)
+legend("bottomright", legend = c(paste("训练集 AUC =", round(auc_train, 4)),
+                                 paste("测试集 AUC =", round(auc_test, 4))),
+       col = c("blue", "red"), lwd = 2, bty = "n")
+```
